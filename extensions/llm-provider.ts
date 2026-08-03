@@ -1,15 +1,17 @@
 /**
- * NewAPI dynamic provider for Pi.
- * https://github.com/xiaohei-info/pi-newapi-provider
+ * Configurable dynamic LLM gateway provider for Pi.
+ * https://github.com/xiaohei-info/pi-llm-provider
  *
- * Fetches model list from the gateway at startup so multiple machines stay in sync
- * without manually editing models.json whenever models change.
+ * Fetches model list from a NewAPI / OpenAI-compatible gateway at startup so
+ * multiple machines stay in sync without hand-editing models.json.
  *
  * Config (env wins over file):
- *   NEWAPI_API_KEY   (required) API key
- *   NEWAPI_BASE_URL  (optional) default https://newapi.xiaohei.tech
+ *   LLM_API_KEY    (required) API key
+ *   LLM_BASE_URL   (required) gateway origin, with or without /v1
+ *   LLM_PROVIDER   (optional) Pi provider id, default "llm"
  *
- * Or put the same keys in ~/.pi/agent/newapi.env for non-interactive shells.
+ * File: ~/.pi/agent/llm-provider.env
+ * Back-compat: NEWAPI_* env keys and ~/.pi/agent/newapi.env
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -49,8 +51,9 @@ type Override = Partial<Omit<ModelDef, "id" | "name" | "cost">> & {
 	cost?: ModelDef["cost"];
 };
 
-const DEFAULT_BASE = "https://newapi.xiaohei.tech";
+const DEFAULT_PROVIDER = "llm";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const LOG_PREFIX = "[llm-provider]";
 
 const GPT_THINK = {
 	off: "none",
@@ -412,9 +415,13 @@ function normalizeBase(raw: string): string {
 	return raw.replace(/\/+$/, "").replace(/\/v1$/i, "");
 }
 
-/** Load KEY=value pairs from ~/.pi/agent/newapi.env (shared across machines). */
-function loadDotEnvFile(): Record<string, string> {
-	const path = join(homedir(), ".pi", "agent", "newapi.env");
+function normalizeProviderId(raw: string): string {
+	const id = raw.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+	return id || DEFAULT_PROVIDER;
+}
+
+/** Parse KEY=value lines from a dotenv-style file. */
+function parseDotEnv(path: string): Record<string, string> {
 	if (!existsSync(path)) return {};
 	const out: Record<string, string> = {};
 	for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
@@ -435,20 +442,67 @@ function loadDotEnvFile(): Record<string, string> {
 	return out;
 }
 
-function resolveConfig(): { apiKey?: string; base: string } {
-	const file = loadDotEnvFile();
-	const apiKey = (process.env.NEWAPI_API_KEY || file.NEWAPI_API_KEY || "").trim() || undefined;
-	const base = normalizeBase(
-		(process.env.NEWAPI_BASE_URL || file.NEWAPI_BASE_URL || DEFAULT_BASE).trim(),
+/**
+ * Load config files. Later files override earlier ones.
+ * Priority (low → high): newapi.env → llm-provider.env → process.env
+ */
+function loadConfigFiles(): Record<string, string> {
+	const agentDir = join(homedir(), ".pi", "agent");
+	return {
+		...parseDotEnv(join(agentDir, "newapi.env")),
+		...parseDotEnv(join(agentDir, "llm-provider.env")),
+	};
+}
+
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+	for (const v of values) {
+		const t = v?.trim();
+		if (t) return t;
+	}
+	return undefined;
+}
+
+function resolveConfig(): { apiKey?: string; base?: string; provider: string } {
+	const file = loadConfigFiles();
+
+	const apiKey = firstNonEmpty(
+		process.env.LLM_API_KEY,
+		process.env.NEWAPI_API_KEY,
+		file.LLM_API_KEY,
+		file.NEWAPI_API_KEY,
 	);
-	// Ensure request-time $NEWAPI_API_KEY resolution works even when only file is present
-	if (apiKey && !process.env.NEWAPI_API_KEY) {
-		process.env.NEWAPI_API_KEY = apiKey;
+
+	const baseRaw = firstNonEmpty(
+		process.env.LLM_BASE_URL,
+		process.env.NEWAPI_BASE_URL,
+		file.LLM_BASE_URL,
+		file.NEWAPI_BASE_URL,
+	);
+
+	const provider = normalizeProviderId(
+		firstNonEmpty(
+			process.env.LLM_PROVIDER,
+			process.env.NEWAPI_PROVIDER,
+			file.LLM_PROVIDER,
+			file.NEWAPI_PROVIDER,
+			DEFAULT_PROVIDER,
+		) ?? DEFAULT_PROVIDER,
+	);
+
+	const base = baseRaw ? normalizeBase(baseRaw) : undefined;
+
+	// Expose resolved values for any downstream $ENV expansion.
+	if (apiKey) {
+		process.env.LLM_API_KEY ??= apiKey;
+		process.env.NEWAPI_API_KEY ??= apiKey;
 	}
-	if (!process.env.NEWAPI_BASE_URL) {
-		process.env.NEWAPI_BASE_URL = base;
+	if (base) {
+		process.env.LLM_BASE_URL ??= base;
+		process.env.NEWAPI_BASE_URL ??= base;
 	}
-	return { apiKey, base };
+	process.env.LLM_PROVIDER ??= provider;
+
+	return { apiKey, base, provider };
 }
 
 function titleize(id: string): string {
@@ -666,11 +720,17 @@ function buildModel(id: string, base: string): ModelDef | undefined {
 }
 
 export default async function (pi: ExtensionAPI) {
-	const { apiKey, base } = resolveConfig();
+	const { apiKey, base, provider } = resolveConfig();
 
-	if (!apiKey) {
+	if (!apiKey || !base) {
+		const missing = [
+			!apiKey ? "LLM_API_KEY" : null,
+			!base ? "LLM_BASE_URL" : null,
+		]
+			.filter(Boolean)
+			.join(", ");
 		console.error(
-			"[newapi-provider] NEWAPI_API_KEY missing (env or ~/.pi/agent/newapi.env); provider not registered",
+			`${LOG_PREFIX} missing ${missing} (set env or ~/.pi/agent/llm-provider.env); provider not registered`,
 		);
 		return;
 	}
@@ -693,7 +753,7 @@ export default async function (pi: ExtensionAPI) {
 			.filter((id): id is string => typeof id === "string" && id.length > 0);
 	} catch (err) {
 		console.error(
-			`[newapi-provider] failed to fetch models from ${base}/v1/models:`,
+			`${LOG_PREFIX} failed to fetch models from ${base}/v1/models:`,
 			err instanceof Error ? err.message : err,
 		);
 		// Fall back to overrides so machines still have known models offline/partial outage
@@ -706,13 +766,13 @@ export default async function (pi: ExtensionAPI) {
 		.sort((a, b) => a.id.localeCompare(b.id));
 
 	if (models.length === 0) {
-		console.error("[newapi-provider] no models to register");
+		console.error(`${LOG_PREFIX} no models to register`);
 		return;
 	}
 
 	// Use resolved key directly so file-based config works without shell exports.
-	pi.registerProvider("newapi", {
-		name: "NewAPI",
+	pi.registerProvider(provider, {
+		name: provider,
 		baseUrl: `${base}/v1`,
 		apiKey,
 		authHeader: true,
@@ -720,5 +780,5 @@ export default async function (pi: ExtensionAPI) {
 		models,
 	});
 
-	console.error(`[newapi-provider] registered ${models.length} models from ${base}`);
+	console.error(`${LOG_PREFIX} registered provider "${provider}" with ${models.length} models from ${base}`);
 }

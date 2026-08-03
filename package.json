@@ -1,24 +1,25 @@
 {
-  "name": "pi-newapi-provider",
+  "name": "pi-llm-provider",
   "version": "1.0.0",
-  "description": "Dynamic NewAPI provider for Pi — auto-discovers models from a NewAPI-compatible gateway",
+  "description": "Configurable dynamic LLM gateway provider for Pi — auto-discovers models from any NewAPI / OpenAI-compatible gateway",
   "keywords": [
     "pi-package",
     "pi-extension",
-    "newapi",
     "llm",
-    "provider"
+    "newapi",
+    "provider",
+    "openai-compatible"
   ],
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xiaohei-info/pi-newapi-provider.git"
+    "url": "git+https://github.com/xiaohei-info/pi-llm-provider.git"
   },
   "bugs": {
-    "url": "https://github.com/xiaohei-info/pi-newapi-provider/issues"
+    "url": "https://github.com/xiaohei-info/pi-llm-provider/issues"
   },
-  "homepage": "https://github.com/xiaohei-info/pi-newapi-provider#readme",
+  "homepage": "https://github.com/xiaohei-info/pi-llm-provider#readme",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

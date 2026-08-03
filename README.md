@@ -1,27 +1,27 @@
-# pi-newapi-provider
+# pi-llm-provider
 
-Dynamic [NewAPI](https://github.com/QuantumNous/new-api)-compatible provider for [Pi](https://pi.dev).
+Configurable dynamic LLM gateway provider for [Pi](https://pi.dev).
 
-Fetches `/v1/models` at startup and registers a `newapi` provider, so multiple machines stay in sync without hand-editing `models.json` every time the gateway model list changes.
+Works with [NewAPI](https://github.com/QuantumNous/new-api) and other OpenAI-compatible gateways that expose `/v1/models`.
+
+Fetches the model list at startup and registers a Pi provider, so multiple machines stay in sync without hand-editing `models.json`.
 
 ## Features
 
-- Auto-discover models from the gateway
-- Per-family API routing:
+- **Configurable** base URL, API key, and provider id
+- Auto-discover models from `GET {baseUrl}/v1/models`
+- Family-aware API routing:
   - GPT → `openai-responses`
   - Claude → `anthropic-messages`
   - DeepSeek / Kimi / GLM / Gemini / Grok / MiniMax → `openai-completions`
-- Hand-tuned overrides for known models (context window, thinking, cost)
+- Hand-tuned overrides for known models (context, thinking, cost)
 - Heuristics for newly added models
 - Filters non-chat models (image / embedding / tts / …)
-- Config via env or `~/.pi/agent/newapi.env`
 
 ## Install
 
-### Option A — Pi package (recommended)
-
 ```bash
-pi install git:github.com/xiaohei-info/pi-newapi-provider
+pi install git:github.com/xiaohei-info/pi-llm-provider
 ```
 
 Or add to `~/.pi/agent/settings.json`:
@@ -29,7 +29,7 @@ Or add to `~/.pi/agent/settings.json`:
 ```json
 {
   "packages": [
-    "git:github.com/xiaohei-info/pi-newapi-provider"
+    "git:github.com/xiaohei-info/pi-llm-provider"
   ]
 }
 ```
@@ -40,43 +40,53 @@ Then:
 pi update --extensions
 ```
 
-### Option B — Local extension copy
-
-```bash
-mkdir -p ~/.pi/agent/extensions
-curl -fsSL \
-  https://raw.githubusercontent.com/xiaohei-info/pi-newapi-provider/main/extensions/newapi-provider.ts \
-  -o ~/.pi/agent/extensions/newapi-provider.ts
-```
-
 ## Configure
 
-Create `~/.pi/agent/newapi.env` (recommended, works for non-interactive shells):
+All settings are read from **environment variables** or **`~/.pi/agent/llm-provider.env`**  
+(env vars win over the file).
+
+| Key | Required | Default | Description |
+|-----|----------|---------|-------------|
+| `LLM_API_KEY` | yes | — | Gateway API key |
+| `LLM_BASE_URL` | yes | — | Gateway origin, e.g. `https://newapi.example.com` (with or without `/v1`) |
+| `LLM_PROVIDER` | no | `llm` | Pi provider id used in `--model provider/model` |
+
+### File example
 
 ```bash
-cat > ~/.pi/agent/newapi.env <<'EOF'
-NEWAPI_API_KEY=sk-your-key
-NEWAPI_BASE_URL=https://newapi.xiaohei.tech
+cat > ~/.pi/agent/llm-provider.env <<'EOF'
+LLM_API_KEY=sk-your-key
+LLM_BASE_URL=https://newapi.example.com
+LLM_PROVIDER=newapi
 EOF
-chmod 600 ~/.pi/agent/newapi.env
+chmod 600 ~/.pi/agent/llm-provider.env
 ```
 
-Or export env vars:
+### Env example
 
 ```bash
-export NEWAPI_API_KEY=sk-your-key
-export NEWAPI_BASE_URL=https://newapi.xiaohei.tech   # optional
+export LLM_API_KEY=sk-your-key
+export LLM_BASE_URL=https://newapi.example.com
+export LLM_PROVIDER=newapi
 ```
 
-> Do **not** commit real API keys. Keep `newapi.env` only on each machine (`chmod 600`).
+> Do **not** commit real API keys.
+
+### Backwards-compatible aliases
+
+These older names still work if the `LLM_*` keys are unset:
+
+- `NEWAPI_API_KEY` → `LLM_API_KEY`
+- `NEWAPI_BASE_URL` → `LLM_BASE_URL`
+- `NEWAPI_PROVIDER` → `LLM_PROVIDER`
+- file `~/.pi/agent/newapi.env` is also loaded (lower priority than `llm-provider.env`)
 
 ## Usage
 
 ```bash
-pi --list-models | rg newapi
-pi --model newapi/claude-sonnet-5
-pi --model newapi/gpt-5.4-mini
-pi --model newapi/deepseek-v4-flash
+pi --list-models
+pi --model newapi/claude-sonnet-5          # if LLM_PROVIDER=newapi
+pi --model llm/gpt-5.4-mini               # if LLM_PROVIDER=llm (default)
 ```
 
 ## How model metadata is chosen
@@ -85,29 +95,33 @@ pi --model newapi/deepseek-v4-flash
 2. Else family heuristics from the model id
 3. Else safe OpenAI-compatible defaults (`contextWindow=128k`)
 
-To tune a model permanently, edit `OVERRIDES` in `extensions/newapi-provider.ts` and push.
+To tune a model permanently, edit `OVERRIDES` in `extensions/llm-provider.ts` and push.
 
-## Multi-machine setup
+## Multi-machine
 
 On each machine:
 
 1. Install Pi
-2. Install this package (or copy the extension file)
-3. Create `~/.pi/agent/newapi.env` with the same key/base URL
+2. Install this package
+3. Create the same `~/.pi/agent/llm-provider.env`
 
-When the gateway adds/removes models, every machine picks it up on next Pi start. No `models.json` sync needed.
+When the gateway adds/removes models, every machine picks it up on next Pi start.
+
+Update the extension everywhere:
+
+```bash
+pi update --extensions
+```
 
 ## Conflict with static `models.json`
 
-If you previously defined a static `newapi` provider in `~/.pi/agent/models.json`, remove it:
+If you previously defined the same provider id in `~/.pi/agent/models.json`, remove it so the dynamic list wins:
 
 ```json
 {
   "providers": {}
 }
 ```
-
-Pi composes `models.json` above extension-registered providers; a static list would fight the dynamic one.
 
 ## License
 
