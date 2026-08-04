@@ -91,10 +91,12 @@ pi --model llm/gpt-5.4-mini               # if LLM_PROVIDER=llm (default)
 
 ## How model metadata is chosen
 
-1. Live lookup against OpenRouter's public model index (context window / max output, best-effort and non-blocking) — applies to every model unless its `OVERRIDES` entry sets `pinLimits: true`
-2. Exact match in `OVERRIDES` (context / thinking / cost / api), filling whatever OpenRouter missed
+1. Live lookup against OpenRouter's public model index (context window, max output, pricing, input modalities, reasoning support — best-effort and non-blocking). Context/max output apply to every model unless its `OVERRIDES` entry sets `pinLimits: true`; pricing/modalities/reasoning fill in only where `OVERRIDES` has no value
+2. Exact match in `OVERRIDES` (api / thinking / compat / cost / context), filling whatever OpenRouter missed
 3. Family heuristics from the model id
 4. Safe OpenAI-compatible defaults (`contextWindow=128k`)
+
+Protocol-level settings — `api` kind, `compat` flags and `thinkingLevelMap` — always come from `OVERRIDES` or heuristics; OpenRouter never overrides them.
 
 To tune a model permanently, edit `OVERRIDES` in `extensions/llm-provider.ts` and push.
 

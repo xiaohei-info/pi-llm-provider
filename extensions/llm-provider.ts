@@ -726,14 +726,23 @@ function heuristic(id: string): Omit<ModelDef, "id" | "name" | "cost" | "baseUrl
 	};
 }
 
-type OrLimits = { contextWindow: number; maxTokens?: number };
-type OrIndex = Map<string, OrLimits>;
+type OrMeta = {
+	contextWindow: number;
+	maxTokens?: number;
+	input?: Array<"text" | "image">;
+	reasoning?: boolean;
+	cost?: ModelDef["cost"];
+};
+type OrIndex = Map<string, OrMeta>;
 
 /**
- * Best-effort lookup of context windows from OpenRouter's public model index
- * (no auth required). Primary source of contextWindow/maxTokens for every
- * model; OVERRIDES and heuristics only fill gaps when the lookup misses
- * (e.g. relay-only model names or network failure).
+ * Best-effort lookup of factual model data from OpenRouter's public model
+ * index (no auth required): context window, max output, pricing, input
+ * modalities and reasoning support. Primary source of contextWindow/maxTokens
+ * for every model; OVERRIDES and heuristics only fill gaps when the lookup
+ * misses (e.g. relay-only model names or network failure). Protocol-level
+ * settings (api kind, compat, thinkingLevelMap) always come from
+ * OVERRIDES/heuristics.
  */
 async function fetchOpenRouterIndex(timeoutMs = 8000): Promise<OrIndex> {
 	const index: OrIndex = new Map();
@@ -750,13 +759,47 @@ async function fetchOpenRouterIndex(timeoutMs = 8000): Promise<OrIndex> {
 				id?: string;
 				context_length?: number;
 				top_provider?: { max_completion_tokens?: number };
+				architecture?: { input_modalities?: string[] };
+				supported_parameters?: string[];
+				pricing?: Record<string, string>;
 			}>;
+		};
+		const perMillion = (v: unknown): number | undefined => {
+			const n = typeof v === "string" ? Number(v) : NaN;
+			return Number.isFinite(n) ? Math.round(n * 1e6 * 1e6) / 1e6 : undefined;
 		};
 		for (const m of payload.data ?? []) {
 			if (!m.id || typeof m.context_length !== "number") continue;
-			const entry: OrLimits = { contextWindow: m.context_length };
+			const entry: OrMeta = { contextWindow: m.context_length };
 			const maxOut = m.top_provider?.max_completion_tokens;
 			if (typeof maxOut === "number" && maxOut > 0) entry.maxTokens = maxOut;
+			// Input modalities (pi only models text/image).
+			const mods = m.architecture?.input_modalities;
+			if (Array.isArray(mods) && mods.length > 0) {
+				const input: Array<"text" | "image"> = ["text"];
+				if (mods.includes("image")) input.push("image");
+				entry.input = input;
+			}
+			// Reasoning support from advertised parameters.
+			if (Array.isArray(m.supported_parameters)) {
+				entry.reasoning =
+					m.supported_parameters.includes("reasoning") ||
+					m.supported_parameters.includes("include_reasoning");
+			}
+			// Pricing is quoted per token; convert to $/M tokens.
+			const p = m.pricing;
+			if (p) {
+				const input = perMillion(p.prompt);
+				const output = perMillion(p.completion);
+				if (input !== undefined && output !== undefined) {
+					entry.cost = {
+						input,
+						output,
+						cacheRead: perMillion(p.input_cache_read) ?? 0,
+						cacheWrite: perMillion(p.input_cache_write) ?? 0,
+					};
+				}
+			}
 			const bare = m.id.split("/").pop();
 			if (bare) index.set(bare.toLowerCase(), entry);
 			index.set(m.id.toLowerCase(), entry);
@@ -782,11 +825,11 @@ function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | unde
 		name: ov.name ?? titleize(id),
 		api,
 		baseUrl: api === "anthropic-messages" ? anthropicBase : openAiBase,
-		reasoning: ov.reasoning ?? h.reasoning,
-		input: ov.input ?? h.input,
+		reasoning: ov.reasoning ?? or?.reasoning ?? h.reasoning,
+		input: ov.input ?? or?.input ?? h.input,
 		contextWindow: or?.contextWindow ?? ov.contextWindow ?? h.contextWindow,
 		maxTokens: or?.maxTokens ?? ov.maxTokens ?? h.maxTokens,
-		cost: ov.cost ?? h.cost ?? ZERO_COST,
+		cost: ov.cost ?? or?.cost ?? h.cost ?? ZERO_COST,
 	};
 
 	const compat = ov.compat ?? h.compat;
