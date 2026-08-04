@@ -48,6 +48,11 @@ type ModelDef = {
 
 type Override = Partial<Omit<ModelDef, "id" | "name" | "cost">> & {
 	name?: string;
+	/**
+	 * When true, this entry's contextWindow/maxTokens always win over the
+	 * OpenRouter live lookup (e.g. to stay inside a short-context pricing tier).
+	 */
+	pinLimits?: boolean;
 	cost?: ModelDef["cost"];
 };
 
@@ -726,7 +731,9 @@ type OrIndex = Map<string, OrLimits>;
 
 /**
  * Best-effort lookup of context windows from OpenRouter's public model index
- * (no auth required). Used as a fallback for models missing from OVERRIDES.
+ * (no auth required). Primary source of contextWindow/maxTokens for every
+ * model; OVERRIDES and heuristics only fill gaps when the lookup misses
+ * (e.g. relay-only model names or network failure).
  */
 async function fetchOpenRouterIndex(timeoutMs = 8000): Promise<OrIndex> {
 	const index: OrIndex = new Map();
@@ -764,7 +771,7 @@ function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | unde
 	if (isImageModel(id)) return undefined;
 
 	const ov = OVERRIDES[id] ?? {};
-	const or = orIndex.get(id.toLowerCase());
+	const or = ov.pinLimits ? undefined : orIndex.get(id.toLowerCase());
 	const h = heuristic(id);
 	const api = (ov.api ?? h.api) as ApiKind;
 	const openAiBase = `${base}/v1`;
@@ -777,8 +784,8 @@ function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | unde
 		baseUrl: api === "anthropic-messages" ? anthropicBase : openAiBase,
 		reasoning: ov.reasoning ?? h.reasoning,
 		input: ov.input ?? h.input,
-		contextWindow: ov.contextWindow ?? or?.contextWindow ?? h.contextWindow,
-		maxTokens: ov.maxTokens ?? or?.maxTokens ?? h.maxTokens,
+		contextWindow: or?.contextWindow ?? ov.contextWindow ?? h.contextWindow,
+		maxTokens: or?.maxTokens ?? ov.maxTokens ?? h.maxTokens,
 		cost: ov.cost ?? h.cost ?? ZERO_COST,
 	};
 
