@@ -396,6 +396,19 @@ const OVERRIDES: Record<string, Override> = {
 			maxTokensField: "max_tokens",
 		},
 	},
+	"qwen3.8-max": {
+		api: "openai-completions",
+		contextWindow: 1048576,
+		maxTokens: 131072,
+		reasoning: true,
+		input: ["text", "image"],
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: false,
+			maxTokensField: "max_tokens",
+		},
+	},
 	"composer-2.5": {
 		api: "openai-completions",
 		contextWindow: 200000,
@@ -674,6 +687,23 @@ function heuristic(id: string): Omit<ModelDef, "id" | "name" | "cost" | "baseUrl
 		};
 	}
 
+	if (x.includes("qwen") || x.includes("tongyi")) {
+		return {
+			api: "openai-completions",
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 262144,
+			maxTokens: 32768,
+			cost: ZERO_COST,
+			compat: {
+				supportsStore: false,
+				supportsDeveloperRole: false,
+				supportsReasoningEffort: false,
+				maxTokensField: "max_tokens",
+			},
+		};
+	}
+
 	// Default: OpenAI-compatible chat completions
 	return {
 		api: "openai-completions",
@@ -691,10 +721,50 @@ function heuristic(id: string): Omit<ModelDef, "id" | "name" | "cost" | "baseUrl
 	};
 }
 
-function buildModel(id: string, base: string): ModelDef | undefined {
+type OrLimits = { contextWindow: number; maxTokens?: number };
+type OrIndex = Map<string, OrLimits>;
+
+/**
+ * Best-effort lookup of context windows from OpenRouter's public model index
+ * (no auth required). Used as a fallback for models missing from OVERRIDES.
+ */
+async function fetchOpenRouterIndex(timeoutMs = 8000): Promise<OrIndex> {
+	const index: OrIndex = new Map();
+	try {
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+		const res = await fetch("https://openrouter.ai/api/v1/models", {
+			signal: ctrl.signal,
+		});
+		clearTimeout(timer);
+		if (!res.ok) return index;
+		const payload = (await res.json()) as {
+			data?: Array<{
+				id?: string;
+				context_length?: number;
+				top_provider?: { max_completion_tokens?: number };
+			}>;
+		};
+		for (const m of payload.data ?? []) {
+			if (!m.id || typeof m.context_length !== "number") continue;
+			const entry: OrLimits = { contextWindow: m.context_length };
+			const maxOut = m.top_provider?.max_completion_tokens;
+			if (typeof maxOut === "number" && maxOut > 0) entry.maxTokens = maxOut;
+			const bare = m.id.split("/").pop();
+			if (bare) index.set(bare.toLowerCase(), entry);
+			index.set(m.id.toLowerCase(), entry);
+		}
+	} catch {
+		// Best effort: network failure must never block provider registration.
+	}
+	return index;
+}
+
+function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | undefined {
 	if (isImageModel(id)) return undefined;
 
 	const ov = OVERRIDES[id] ?? {};
+	const or = orIndex.get(id.toLowerCase());
 	const h = heuristic(id);
 	const api = (ov.api ?? h.api) as ApiKind;
 	const openAiBase = `${base}/v1`;
@@ -707,8 +777,8 @@ function buildModel(id: string, base: string): ModelDef | undefined {
 		baseUrl: api === "anthropic-messages" ? anthropicBase : openAiBase,
 		reasoning: ov.reasoning ?? h.reasoning,
 		input: ov.input ?? h.input,
-		contextWindow: ov.contextWindow ?? h.contextWindow,
-		maxTokens: ov.maxTokens ?? h.maxTokens,
+		contextWindow: ov.contextWindow ?? or?.contextWindow ?? h.contextWindow,
+		maxTokens: ov.maxTokens ?? or?.maxTokens ?? h.maxTokens,
 		cost: ov.cost ?? h.cost ?? ZERO_COST,
 	};
 
@@ -760,8 +830,10 @@ export default async function (pi: ExtensionAPI) {
 		ids = Object.keys(OVERRIDES);
 	}
 
+	const orIndex = await fetchOpenRouterIndex();
+
 	const models = ids
-		.map((id) => buildModel(id, base))
+		.map((id) => buildModel(id, base, orIndex))
 		.filter((m): m is ModelDef => Boolean(m))
 		.sort((a, b) => a.id.localeCompare(b.id));
 
