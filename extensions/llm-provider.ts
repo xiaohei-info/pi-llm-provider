@@ -92,6 +92,9 @@ const GLM_THINK = {
 
 /** Hand-tuned metadata for important models. Unknown models use heuristics. */
 const OVERRIDES: Record<string, Override> = {
+	"gpt-6-astra": {
+		thinkingLevelMap: { ...GPT_THINK_MAX },
+	},
 	"gpt-5.6-sol": {
 		api: "openai-responses",
 		contextWindow: 272000,
