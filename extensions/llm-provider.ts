@@ -16,7 +16,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type ApiKind = "openai-completions" | "openai-responses" | "anthropic-messages";
 
@@ -842,6 +842,135 @@ function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | unde
 	return model;
 }
 
+/** Opt-in policy; Pi's native reserve/overflow compaction remains unchanged. */
+export type AdaptiveCompactionConfig = {
+	enabled: boolean;
+	windowBoundary: number;
+	largeWindowRatio: number;
+	smallWindowRatio: number;
+};
+
+export function resolveAdaptiveCompactionConfig(
+	file: Record<string, string>, env: Record<string, string | undefined> = process.env,
+): AdaptiveCompactionConfig {
+	const value = (key: string) => env[key] ?? file[key];
+	const enabled = value("LLM_COMPACTION_ENABLED")?.trim().toLowerCase() ?? "false";
+	const number = (key: string, fallback: number, ratio = false) => {
+		const raw = value(key);
+		const n = raw === undefined ? fallback : Number(raw.trim());
+		if (!Number.isFinite(n) || n <= 0 || (ratio ? n > 1 : !Number.isSafeInteger(n))) {
+			throw new Error(`${key} must be ${ratio ? "a number in (0, 1]" : "a positive safe integer"}`);
+		}
+		return n;
+	};
+	if (enabled !== "true" && enabled !== "false") {
+		throw new Error("LLM_COMPACTION_ENABLED must be true or false");
+	}
+	return {
+		enabled: enabled === "true",
+		windowBoundary: number("LLM_COMPACTION_WINDOW_BOUNDARY", 500000),
+		largeWindowRatio: number("LLM_COMPACTION_LARGE_WINDOW_RATIO", 0.5, true),
+		smallWindowRatio: number("LLM_COMPACTION_SMALL_WINDOW_RATIO", 0.8, true),
+	};
+}
+
+export function registerAdaptiveCompaction(
+	pi: ExtensionAPI, provider: string, config: AdaptiveCompactionConfig,
+) {
+	if (!config.enabled) return;
+	type Attempt = { leaf: string | null; tokens: number; at: number; status: "pending" | "success" | "failure" };
+	const attempts = new Map<string, Attempt>();
+	let inFlight = false;
+	let generation = 0;
+	const scope = (ctx: ExtensionContext) => {
+		if (ctx.model?.provider !== provider) return undefined;
+		const usage = ctx.getContextUsage();
+		if (!usage || typeof usage.tokens !== "number" || !Number.isFinite(usage.tokens) || usage.tokens < 0 ||
+			!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) return undefined;
+		return { usage, key: JSON.stringify([ctx.sessionManager.getSessionId(), provider, ctx.model.id, usage.contextWindow]) };
+	};
+	const check = async (_event: unknown, ctx: ExtensionContext) => {
+		// ctx.compact() aborts the active run. Never invoke it at turn_end/agent_end:
+		// native post-run compaction and tool/follow-up turns have not finished there.
+		if (inFlight || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		const current = scope(ctx);
+		if (!current) return;
+		const { key, usage } = current;
+		const tokens = usage.tokens as number;
+		const ratio = usage.contextWindow > config.windowBoundary ? config.largeWindowRatio : config.smallWindowRatio;
+		if (tokens < usage.contextWindow * ratio) {
+			attempts.delete(key);
+			return;
+		}
+		const leaf = ctx.sessionManager.getLeafId();
+		const previous = attempts.get(key);
+		if (previous) {
+			if (previous.status === "pending" || previous.leaf === leaf) return;
+			// A failed summary needs both new history and a cooldown. A successful
+			// summary still above target needs material growth, not another immediate summary.
+			if (previous.status === "failure" && Date.now() - previous.at < 60000) return;
+			if (previous.status === "success" && tokens < previous.tokens + Math.max(1024, usage.contextWindow * 0.05)) return;
+		}
+		const attempt: Attempt = { leaf, tokens, at: Date.now(), status: "pending" };
+		attempts.set(key, attempt);
+		inFlight = true;
+		const epoch = generation;
+		// Await callbacks so RPC does not announce agent_settled before the summary
+		// finishes. No UI requests or background polling timers are needed.
+		await new Promise<void>((resolve) => {
+			const finish = (status: "success" | "failure") => {
+				if (epoch === generation) {
+					attempt.status = status;
+					attempt.at = Date.now();
+					attempt.leaf = ctx.sessionManager.getLeafId();
+					inFlight = false;
+				}
+				resolve();
+			};
+			try {
+				ctx.compact({
+					onComplete: () => finish("success"),
+					onError: () => {
+						console.error(`${LOG_PREFIX} adaptive compaction failed; retry requires new history and 60s cooldown`);
+						finish("failure");
+					},
+				});
+			} catch {
+				finish("failure");
+			}
+		});
+	};
+	// Track native/manual compaction too: a failed native attempt must not cause
+	// an immediate adaptive retry at agent_settled. Never cancel a native attempt.
+	pi.on("session_before_compact", (_event, ctx) => {
+		if (inFlight) return;
+		const current = scope(ctx);
+		if (current) attempts.set(current.key, {
+			leaf: ctx.sessionManager.getLeafId(), tokens: current.usage.tokens as number,
+			at: Date.now(), status: "pending",
+		});
+	});
+	const externalFinish = (ctx: ExtensionContext, status: "success" | "failure") => {
+		if (inFlight || ctx.model?.provider !== provider) return;
+		// Usage is deliberately unknown immediately after Pi compaction.
+		const key = JSON.stringify([ctx.sessionManager.getSessionId(), provider, ctx.model.id,
+			ctx.getContextUsage()?.contextWindow ?? ctx.model.contextWindow]);
+		const attempt = attempts.get(key);
+		if (attempt) {
+			attempt.status = status;
+			attempt.at = Date.now();
+			attempt.leaf = ctx.sessionManager.getLeafId();
+		}
+	};
+	pi.on("session_compact", (_event, ctx) => externalFinish(ctx, "success"));
+	pi.on("session_compact_failed", (_event, ctx) => externalFinish(ctx, "failure"));
+	pi.on("session_start", check);
+	pi.on("session_tree", check);
+	pi.on("model_select", check);
+	pi.on("agent_settled", check);
+	pi.on("session_shutdown", () => { generation++; inFlight = false; attempts.clear(); });
+}
+
 export default async function (pi: ExtensionAPI) {
 	const { apiKey, base, provider } = resolveConfig();
 
@@ -904,6 +1033,12 @@ export default async function (pi: ExtensionAPI) {
 		api: "openai-completions",
 		models,
 	});
+
+	try {
+		registerAdaptiveCompaction(pi, provider, resolveAdaptiveCompactionConfig(loadConfigFiles()));
+	} catch (error) {
+		console.error(`${LOG_PREFIX} adaptive compaction disabled: ${error instanceof Error ? error.message : "invalid config"}`);
+	}
 
 	console.error(`${LOG_PREFIX} registered provider "${provider}" with ${models.length} models from ${base}`);
 }

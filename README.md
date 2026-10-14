@@ -81,6 +81,54 @@ These older names still work if the `LLM_*` keys are unset:
 - `NEWAPI_PROVIDER` → `LLM_PROVIDER`
 - file `~/.pi/agent/newapi.env` is also loaded (lower priority than `llm-provider.env`)
 
+## Adaptive compaction (Pi 1.2.0 or newer)
+
+Adaptive compaction is opt-in and applies only to this extension's provider. Add
+these keys to the existing `~/.pi/agent/llm-provider.env` (or export them as
+environment variables, which take precedence):
+
+```dotenv
+LLM_COMPACTION_ENABLED=true
+LLM_COMPACTION_WINDOW_BOUNDARY=500000
+LLM_COMPACTION_LARGE_WINDOW_RATIO=0.5
+LLM_COMPACTION_SMALL_WINDOW_RATIO=0.8
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `LLM_COMPACTION_ENABLED` | `false` | Accepts `true` or `false` (case insensitive). |
+| `LLM_COMPACTION_WINDOW_BOUNDARY` | `500000` | Positive integer; windows strictly greater than this use the large-window ratio. |
+| `LLM_COMPACTION_LARGE_WINDOW_RATIO` | `0.5` | Ratio in `(0, 1]` for windows above the boundary. |
+| `LLM_COMPACTION_SMALL_WINDOW_RATIO` | `0.8` | Ratio in `(0, 1]` for windows at or below the boundary. |
+
+With these defaults, a 1,000,000-token window triggers at 500,000 tokens, and a
+500,000-token window triggers at 400,000 tokens. The threshold is inclusive
+(`tokens >= contextWindow * ratio`) and uses Pi's effective context usage/window,
+not a separately configured fixed reserve. These ratios control when compaction
+starts; Pi's existing compaction settings control how much history is kept and
+how the summary is generated.
+
+Set `LLM_COMPACTION_ENABLED=false` to disable the adaptive policy. Pi's native
+threshold and overflow handling remain enabled according to Pi's own settings;
+the extension never changes those settings. Invalid adaptive configuration logs
+an error and disables only this policy. Configuration is read when the extension
+loads, so editing the file does not update an already loaded session.
+
+The policy checks restored sessions, tree navigation, model selection and
+`agent_settled`, and waits for an idle session without queued messages. It works
+without UI in RPC mode and waits for compaction callbacks before returning from
+the event handler. Unknown usage is skipped. Repeated events share an in-flight
+guard; native/manual attempts suppress immediate competing adaptive work. A
+failed attempt needs both new history and a 60-second cooldown before retrying
+on a later event. A successful summary still above the threshold needs growth of
+at least `max(1024, 5% of window)` from the previous attempt's usage before another
+attempt, unless usage has first fallen below the threshold. There is no retry
+polling timer. Native protection can act earlier than the adaptive ratio.
+
+Local verification: `npm test` (Node with `--experimental-strip-types` support).
+The SDK tests use Pi 1.2.0 with fixture catalogues, responses and summaries; they
+exercise the real compaction lifecycle without contacting a real model service.
+
 ## Usage
 
 ```bash
