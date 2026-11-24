@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-type ApiKind = "openai-completions" | "openai-responses" | "anthropic-messages";
+type ApiKind = "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai";
 
 type ModelDef = {
 	id: string;
@@ -88,6 +88,16 @@ const GLM_THINK = {
 	high: "high",
 	xhigh: null,
 	max: "max",
+} as const;
+
+const GEMINI_THINK = {
+	off: null,
+	minimal: null,
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: null,
+	max: null,
 } as const;
 
 /** Hand-tuned metadata for important models. Unknown models use heuristics. */
@@ -317,17 +327,11 @@ const OVERRIDES: Record<string, Override> = {
 		thinkingLevelMap: { ...GLM_THINK },
 	},
 	"gemini-3.1-pro": {
-		api: "openai-completions",
+		api: "google-generative-ai",
 		contextWindow: 1048576,
 		maxTokens: 65536,
 		reasoning: true,
 		input: ["text", "image"],
-		compat: {
-			supportsStore: false,
-			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
-			maxTokensField: "max_tokens",
-		},
 		thinkingLevelMap: {
 			off: null,
 			minimal: null,
@@ -340,18 +344,12 @@ const OVERRIDES: Record<string, Override> = {
 		cost: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 0 },
 	},
 	"gemini-3.5-flash": {
-		api: "openai-completions",
+		api: "google-generative-ai",
 		contextWindow: 1048576,
 		maxTokens: 65536,
 		reasoning: true,
 		input: ["text", "image"],
-		compat: {
-			supportsStore: false,
-			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
-			maxTokensField: "max_tokens",
-		},
-		thinkingLevelMap: { off: null },
+		thinkingLevelMap: { ...GEMINI_THINK },
 		cost: { input: 1.5, output: 9, cacheRead: 0.15, cacheWrite: 0 },
 	},
 	"grok-4.5": {
@@ -645,19 +643,19 @@ function heuristic(id: string): Omit<ModelDef, "id" | "name" | "cost" | "baseUrl
 	}
 
 	if (x.includes("gemini")) {
+		const usesThinkingLevel =
+			/gemini-(?:[3-9]|[1-9]\d)/.test(x) ||
+			x === "gemini-flash-latest" ||
+			x === "gemini-flash-lite-latest" ||
+			x === "gemini-pro-latest";
 		return {
-			api: "openai-completions",
+			api: "google-generative-ai",
 			reasoning: true,
 			input: ["text", "image"],
 			contextWindow: 1048576,
 			maxTokens: 65536,
 			cost: ZERO_COST,
-			compat: {
-				supportsStore: false,
-				supportsDeveloperRole: false,
-				supportsReasoningEffort: false,
-				maxTokensField: "max_tokens",
-			},
+			...(usesThinkingLevel ? { thinkingLevelMap: { ...GEMINI_THINK } } : {}),
 		};
 	}
 
@@ -820,14 +818,18 @@ function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | unde
 	const or = ov.pinLimits ? undefined : orIndex.get(id.toLowerCase());
 	const h = heuristic(id);
 	const api = (ov.api ?? h.api) as ApiKind;
-	const openAiBase = `${base}/v1`;
-	const anthropicBase = base;
+	const baseUrl =
+		api === "anthropic-messages"
+			? base
+			: api === "google-generative-ai"
+				? `${base}/v1beta`
+				: `${base}/v1`;
 
 	const model: ModelDef = {
 		id,
 		name: ov.name ?? titleize(id),
 		api,
-		baseUrl: api === "anthropic-messages" ? anthropicBase : openAiBase,
+		baseUrl,
 		reasoning: ov.reasoning ?? or?.reasoning ?? h.reasoning,
 		input: ov.input ?? or?.input ?? h.input,
 		contextWindow: or?.contextWindow ?? ov.contextWindow ?? h.contextWindow,

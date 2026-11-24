@@ -13,7 +13,8 @@ Fetches the model list at startup and registers a Pi provider, so multiple machi
 - Family-aware API routing:
   - GPT → `openai-responses`
   - Claude → `anthropic-messages`
-  - DeepSeek / Kimi / GLM / Gemini / Grok / MiniMax → `openai-completions`
+  - Gemini → `google-generative-ai` (`/v1beta`)
+  - DeepSeek / Kimi / GLM / Grok / MiniMax / Qwen → `openai-completions`
 - Hand-tuned overrides for known models (context, thinking, cost)
 - Heuristics for newly added models
 - Filters non-chat models (image / embedding / tts / …)
