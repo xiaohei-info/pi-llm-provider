@@ -6,9 +6,12 @@
  * multiple machines stay in sync without hand-editing models.json.
  *
  * Config (env wins over file):
- *   LLM_API_KEY    (required) API key
- *   LLM_BASE_URL   (required) gateway origin, with or without /v1
- *   LLM_PROVIDER   (optional) Pi provider id, default "llm"
+ *   LLM_API_KEY        (required) API key
+ *   LLM_BASE_URL       (required) gateway origin, with or without /v1
+ *   LLM_PROVIDER       (optional) Pi provider id, default "llm"
+ *   LLM_PROTOCOLS      (optional) series -> protocol rules, e.g.
+ *                      "gpt-*:responses,claude-*:messages,gemini-*:messages"
+ *   LLM_DEFAULT_PROTOCOL (optional) protocol for unmatched models, default "chat"
  *
  * File: ~/.pi/agent/llm-provider.env
  * Back-compat: NEWAPI_* env keys and ~/.pi/agent/newapi.env
@@ -60,6 +63,87 @@ const DEFAULT_PROVIDER = "llm";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const LOG_PREFIX = "[llm-provider]";
 
+/** Accepted protocol spellings (case-insensitive) mapped to Pi's native api kinds. */
+const PROTOCOL_ALIASES: Record<string, ApiKind> = {
+	chat: "openai-completions",
+	completions: "openai-completions",
+	chat_completions: "openai-completions",
+	"openai-completions": "openai-completions",
+	responses: "openai-responses",
+	codex_responses: "openai-responses",
+	"openai-responses": "openai-responses",
+	messages: "anthropic-messages",
+	anthropic: "anthropic-messages",
+	anthropic_messages: "anthropic-messages",
+	"anthropic-messages": "anthropic-messages",
+	gemini: "google-generative-ai",
+	gemini_native: "google-generative-ai",
+	"google-generative-ai": "google-generative-ai",
+	"generate-content": "google-generative-ai",
+};
+
+export function resolveProtocol(raw: string): ApiKind {
+	const api = PROTOCOL_ALIASES[String(raw ?? "").trim().toLowerCase()];
+	if (!api) {
+		throw new Error(
+			`Unknown protocol ${JSON.stringify(String(raw ?? ""))}; use chat, responses, messages or gemini`,
+		);
+	}
+	return api;
+}
+
+export type ProtocolRule = { pattern: string; api: ApiKind };
+export type ProtocolRouting = { rules: ProtocolRule[]; defaultApi: ApiKind };
+
+/**
+ * Used only when the config sets no LLM_PROTOCOLS key at all. An explicitly
+ * configured list (even empty) replaces these rules outright.
+ */
+const DEFAULT_PROTOCOL_RULES = "gpt-*:responses,claude-*:messages,gemini-*:messages";
+
+/** Parse "pattern:protocol,pattern=protocol" into rules, keeping the given order. */
+export function parseProtocolRules(raw: string): ProtocolRule[] {
+	const rules: ProtocolRule[] = [];
+	for (const entry of String(raw ?? "").split(/[,;]/)) {
+		const text = entry.trim();
+		if (!text) continue;
+		const separator = text.search(/[:=]/);
+		const pattern = separator > 0 ? text.slice(0, separator).trim() : "";
+		if (!pattern) {
+			throw new Error(`Invalid protocol rule ${JSON.stringify(text)}; expected pattern:protocol`);
+		}
+		rules.push({ pattern: pattern.toLowerCase(), api: resolveProtocol(text.slice(separator + 1)) });
+	}
+	return rules;
+}
+
+/** Case-insensitive glob match; only `*` (any run) and `?` (one char) are wildcards. */
+function globMatch(pattern: string, value: string): boolean {
+	const source = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+	return new RegExp(`^${source}$`, "i").test(value);
+}
+
+/**
+ * Protocol for one model: the most specific matching rule (fewest wildcards,
+ * earliest on a tie) matched against both the full id and its bare name, else
+ * the configured default.
+ */
+export function resolveModelProtocol(rules: ProtocolRule[], fallback: ApiKind, model: string): ApiKind {
+	const full = String(model ?? "");
+	const bare = full.split("/").pop() ?? full;
+	let best: ProtocolRule | undefined;
+	let bestScore = -1;
+	for (const rule of rules) {
+		if (!globMatch(rule.pattern, bare) && !globMatch(rule.pattern, full)) continue;
+		const score = rule.pattern.replace(/[*?]/g, "").length;
+		if (score > bestScore) {
+			best = rule;
+			bestScore = score;
+		}
+	}
+	return best?.api ?? fallback;
+}
+
 const GPT_THINK = {
 	off: "none",
 	minimal: null,
@@ -100,7 +184,12 @@ const GEMINI_THINK = {
 	max: null,
 } as const;
 
-/** Hand-tuned metadata for important models. Unknown models use heuristics. */
+/**
+ * Hand-tuned metadata for important models. Unknown models use heuristics.
+ * The `api` fields here (and in heuristic()) are inert catalog data kept in sync
+ * with Hermes' pi-metadata.json: the wire protocol comes only from LLM_PROTOCOLS /
+ * LLM_DEFAULT_PROTOCOL, never from these overrides.
+ */
 const OVERRIDES: Record<string, Override> = {
 	"gpt-6-astra": {
 		thinkingLevelMap: { ...GPT_THINK_MAX },
@@ -481,6 +570,34 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
 	return undefined;
 }
 
+/**
+ * Raw value of the first key that is *set* (an empty value counts as set, unlike
+ * firstNonEmpty) — env before file, matching the rest of the config precedence.
+ */
+function firstDefined(
+	keys: string[], file: Record<string, string>, env: Record<string, string | undefined>,
+): string | undefined {
+	for (const key of keys) {
+		if (env[key] !== undefined) return env[key];
+	}
+	for (const key of keys) {
+		if (Object.prototype.hasOwnProperty.call(file, key)) return file[key];
+	}
+	return undefined;
+}
+
+/** Series rules plus the fallback protocol for unmatched models. */
+export function resolveProtocolRouting(
+	file: Record<string, string>, env: Record<string, string | undefined> = process.env,
+): ProtocolRouting {
+	const rules = firstDefined(["LLM_PROTOCOLS", "NEWAPI_PROTOCOLS"], file, env);
+	const fallback = firstDefined(["LLM_DEFAULT_PROTOCOL", "NEWAPI_DEFAULT_PROTOCOL"], file, env);
+	return {
+		rules: parseProtocolRules(rules === undefined ? DEFAULT_PROTOCOL_RULES : rules),
+		defaultApi: resolveProtocol(fallback === undefined ? "chat" : fallback),
+	};
+}
+
 function resolveConfig(): { apiKey?: string; base?: string; provider: string } {
 	const file = loadConfigFiles();
 
@@ -811,13 +928,15 @@ async function fetchOpenRouterIndex(timeoutMs = 8000): Promise<OrIndex> {
 	return index;
 }
 
-function buildModel(id: string, base: string, orIndex: OrIndex): ModelDef | undefined {
+function buildModel(
+	id: string, base: string, orIndex: OrIndex, routing: ProtocolRouting,
+): ModelDef | undefined {
 	if (isImageModel(id)) return undefined;
 
 	const ov = OVERRIDES[id] ?? {};
 	const or = ov.pinLimits ? undefined : orIndex.get(id.toLowerCase());
 	const h = heuristic(id);
-	const api = (ov.api ?? h.api) as ApiKind;
+	const api = resolveModelProtocol(routing.rules, routing.defaultApi, id);
 	const baseUrl =
 		api === "anthropic-messages"
 			? base
@@ -975,6 +1094,7 @@ export function registerAdaptiveCompaction(
 
 export default async function (pi: ExtensionAPI) {
 	const { apiKey, base, provider } = resolveConfig();
+	const routing = resolveProtocolRouting(loadConfigFiles());
 
 	if (!apiKey || !base) {
 		const missing = [
@@ -1017,7 +1137,7 @@ export default async function (pi: ExtensionAPI) {
 	const orIndex = await fetchOpenRouterIndex();
 
 	const models = ids
-		.map((id) => buildModel(id, base, orIndex))
+		.map((id) => buildModel(id, base, orIndex, routing))
 		.filter((m): m is ModelDef => Boolean(m))
 		.sort((a, b) => a.id.localeCompare(b.id));
 

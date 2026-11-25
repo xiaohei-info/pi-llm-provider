@@ -8,13 +8,9 @@ Fetches the model list at startup and registers a Pi provider, so multiple machi
 
 ## Features
 
-- **Configurable** base URL, API key, and provider id
+- **Configurable** base URL, API key, provider id, and model-series → protocol rules
 - Auto-discover models from `GET {baseUrl}/v1/models`
-- Family-aware API routing:
-  - GPT → `openai-responses`
-  - Claude → `anthropic-messages`
-  - Gemini → `google-generative-ai` (`/v1beta`)
-  - DeepSeek / Kimi / GLM / Grok / MiniMax / Qwen → `openai-completions`
+- Configurable per-series protocol routing (default rules below), with a configurable fallback
 - Hand-tuned overrides for known models (context, thinking, cost)
 - Heuristics for newly added models
 - Filters non-chat models (image / embedding / tts / …)
@@ -51,6 +47,44 @@ All settings are read from **environment variables** or **`~/.pi/agent/llm-provi
 | `LLM_API_KEY` | yes | — | Gateway API key |
 | `LLM_BASE_URL` | yes | — | Gateway origin, e.g. `https://newapi.example.com` (with or without `/v1`) |
 | `LLM_PROVIDER` | no | `llm` | Pi provider id used in `--model provider/model` |
+| `LLM_PROTOCOLS` | no | see below | Model-series → protocol rules |
+| `LLM_DEFAULT_PROTOCOL` | no | `chat` | Protocol for models matched by no rule |
+
+### Protocol routing
+
+`LLM_PROTOCOLS` is a comma- or semicolon-separated list of `pattern:protocol` (or
+`pattern=protocol`) rules. Patterns are globs — `*` matches any run, `?` one
+character — and are matched case-insensitively against the model id and against
+the bare name after any `provider/` prefix.
+
+```dotenv
+LLM_PROTOCOLS=gpt-*:responses,claude-*:messages,gemini-*:messages
+LLM_DEFAULT_PROTOCOL=chat
+```
+
+Accepted protocol names (case-insensitive), and what they mean for Pi:
+
+| Name | Aliases | Pi `api` | `baseUrl` |
+| --- | --- | --- | --- |
+| chat | `chat`, `completions`, `chat_completions`, `openai-completions` | `openai-completions` | `{origin}/v1` |
+| responses | `responses`, `codex_responses`, `openai-responses` | `openai-responses` | `{origin}/v1` |
+| messages | `messages`, `anthropic`, `anthropic_messages`, `anthropic-messages` | `anthropic-messages` | `{origin}` |
+| gemini | `gemini`, `gemini_native`, `google-generative-ai`, `generate-content` | `google-generative-ai` | `{origin}/v1beta` |
+
+Resolution order for each model:
+
+1. The most specific matching rule. Specificity is the number of non-wildcard
+   characters, so `gpt-4o*:chat` beats `gpt-*:responses`; equal specificity keeps
+   the earlier rule.
+2. `LLM_DEFAULT_PROTOCOL` when no rule matches.
+
+If `LLM_PROTOCOLS` is **not set at all**, the built-in default rules are
+`gpt-*:responses`, `claude-*:messages`, `gemini-*:messages` — every other family
+(`deepseek-*`, `kimi-*`, `glm-*`, `grok-*`, `qwen-*`, `minimax-*`, …) falls back to
+`LLM_DEFAULT_PROTOCOL`. If you set the key — even to an empty value — your rules
+are the only rules; the built-in `gpt-*`/`claude-*`/`gemini-*` entries are no
+longer added. An unknown protocol name or a malformed rule is a load-time error,
+never a silent fallback.
 
 ### File example
 
@@ -59,6 +93,8 @@ cat > ~/.pi/agent/llm-provider.env <<'EOF'
 LLM_API_KEY=sk-your-key
 LLM_BASE_URL=https://newapi.example.com
 LLM_PROVIDER=newapi
+LLM_PROTOCOLS=gpt-*:responses,claude-*:messages,gemini-*:messages
+LLM_DEFAULT_PROTOCOL=chat
 EOF
 chmod 600 ~/.pi/agent/llm-provider.env
 ```
@@ -80,6 +116,8 @@ These older names still work if the `LLM_*` keys are unset:
 - `NEWAPI_API_KEY` → `LLM_API_KEY`
 - `NEWAPI_BASE_URL` → `LLM_BASE_URL`
 - `NEWAPI_PROVIDER` → `LLM_PROVIDER`
+- `NEWAPI_PROTOCOLS` → `LLM_PROTOCOLS`
+- `NEWAPI_DEFAULT_PROTOCOL` → `LLM_DEFAULT_PROTOCOL`
 - file `~/.pi/agent/newapi.env` is also loaded (lower priority than `llm-provider.env`)
 
 ## Adaptive compaction (Pi 1.2.0 or newer)
@@ -141,13 +179,19 @@ pi --model llm/gpt-5.4-mini               # if LLM_PROVIDER=llm (default)
 ## How model metadata is chosen
 
 1. Live lookup against OpenRouter's public model index (context window, max output, pricing, input modalities, reasoning support — best-effort and non-blocking). Context/max output apply to every model unless its `OVERRIDES` entry sets `pinLimits: true`; pricing/modalities/reasoning fill in only where `OVERRIDES` has no value
-2. Exact match in `OVERRIDES` (api / thinking / compat / cost / context), filling whatever OpenRouter missed
+2. Exact match in `OVERRIDES` (thinking / compat / cost / context), filling whatever OpenRouter missed
 3. Family heuristics from the model id
 4. Safe OpenAI-compatible defaults (`contextWindow=128k`)
 
-Protocol-level settings — `api` kind, `compat` flags and `thinkingLevelMap` — always come from `OVERRIDES` or heuristics; OpenRouter never overrides them.
+Protocol-level `compat` flags and `thinkingLevelMap` always come from `OVERRIDES` or heuristics; OpenRouter never overrides them.
 
-To tune a model permanently, edit `OVERRIDES` in `extensions/llm-provider.ts` and push.
+The wire protocol itself is **not** part of this metadata chain: it comes only
+from `LLM_PROTOCOLS` / `LLM_DEFAULT_PROTOCOL`. The `api` fields kept in `OVERRIDES`
+and `heuristic()` mirror Hermes' `pi-metadata.json` and do not decide routing — so
+a `gpt-*` model can be sent over `chat`, and a `gemini-*` model can be sent over
+`messages`, purely from configuration.
+
+To tune a model's metadata permanently, edit `OVERRIDES` in `extensions/llm-provider.ts` and push. Wire protocols are tuned per machine in `llm-provider.env` instead.
 
 ## Multi-machine
 
